@@ -34,7 +34,7 @@ cd showreel
 npm install
 npm install --no-save playwright && npx playwright install chromium
 pip install imageio-ffmpeg        # or point FFMPEG at your own ffmpeg
-npm run render                    # about 15 minutes on 4 cores
+npm run render                    # 15 to 20 minutes on 4 cores
 npm run stills -- 2.9,13.8        # quick PNG stills at given times, into out/stills
 ```
 

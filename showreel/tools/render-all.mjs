@@ -71,8 +71,19 @@ async function main() {
     '-r', '60', '-c:a', 'aac', '-b:a', '256k', '-ar', '48000',
     '-movflags', '+faststart', '-shortest', out,
   ]);
-  const mb = (fs.statSync(out).size / 1e6).toFixed(1);
-  console.log(`wrote ${path.relative(root, out)} (${mb} MB) in ${((Date.now() - t0) / 1000).toFixed(0)}s`);
+  // Cover art: the end card, so file browsers don't show the black first frame.
+  const poster = path.join(root, 'out/poster.jpg');
+  execFileSync(ffmpegPath(), ['-y', '-hide_banner', '-loglevel', 'error', '-ss', '14.9', '-i', out, '-frames:v', '1', '-q:v', '2', poster]);
+  const final = path.join(root, args.final || 'claude-showreel.mp4');
+  execFileSync(ffmpegPath(), [
+    '-y', '-hide_banner', '-loglevel', 'error', '-i', out, '-i', poster,
+    '-map', '0', '-map', '1', '-c', 'copy', '-disposition:v:1', 'attached_pic',
+    '-metadata', 'title=Claude — Motion Reel 2026', '-metadata', 'artist=Claude',
+    '-metadata', 'comment=Rendered in code: headless Chromium + WebGL, soundtrack synthesized from scratch.',
+    '-movflags', '+faststart', final,
+  ]);
+  const mb = (fs.statSync(final).size / 1e6).toFixed(1);
+  console.log(`wrote ${path.relative(root, final)} (${mb} MB) in ${((Date.now() - t0) / 1000).toFixed(0)}s`);
 }
 
 main().catch((e) => {
