@@ -1,0 +1,16 @@
+{
+  "name": "claude-showreel",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A 15-second motion design showreel, rendered frame-by-frame in headless Chromium.",
+  "type": "module",
+  "scripts": {
+    "glyphs": "node tools/build-glyphs.mjs",
+    "audio": "node tools/audio.mjs",
+    "stills": "node tools/render.mjs --samples 8 --stills",
+    "render": "node tools/render-all.mjs --workers 3 --samples 12"
+  },
+  "dependencies": {
+    "fontkit": "^2.0.4"
+  }
+}
