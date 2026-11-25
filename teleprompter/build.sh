@@ -22,10 +22,12 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key><string>com.sean.teleprompter</string>
   <key>CFBundleExecutable</key><string>Teleprompter</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>1.1</string>
+  <key>CFBundleVersion</key><string>2</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSCameraUsageDescription</key><string>Teleprompter uses the camera to record your video while you read.</string>
+  <key>NSMicrophoneUsageDescription</key><string>Teleprompter uses the microphone to record your voice with the video.</string>
 </dict>
 </plist>
 PLIST

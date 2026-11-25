@@ -1,5 +1,6 @@
 import AppKit
 import QuartzCore
+import AVFoundation
 
 // MARK: - Settings
 
@@ -149,6 +150,97 @@ final class SettingsViewController: NSViewController {
     }
 }
 
+// MARK: - Camera recorder
+
+final class Recorder: NSObject, AVCaptureFileOutputRecordingDelegate {
+    let session = AVCaptureSession()
+    private let output = AVCaptureMovieFileOutput()
+    private let queue = DispatchQueue(label: "teleprompter.recorder")
+    private var configured = false
+    private(set) var isRecording = false
+
+    var onStarted: (() -> Void)?
+    var onFinished: ((URL?) -> Void)?
+
+    /// Asks for camera + mic access, then turns the camera on.
+    func startCamera(_ done: @escaping (Bool) -> Void) {
+        AVCaptureDevice.requestAccess(for: .video) { videoOK in
+            AVCaptureDevice.requestAccess(for: .audio) { _ in
+                guard videoOK else { DispatchQueue.main.async { done(false) }; return }
+                self.queue.async {
+                    if !self.configured { self.configure() }
+                    if self.configured && !self.session.isRunning { self.session.startRunning() }
+                    let ok = self.configured
+                    DispatchQueue.main.async { done(ok) }
+                }
+            }
+        }
+    }
+
+    func stopCamera() {
+        queue.async {
+            if !self.output.isRecording && self.session.isRunning { self.session.stopRunning() }
+        }
+    }
+
+    private func configure() {
+        session.beginConfiguration()
+        session.sessionPreset = .high
+        guard let cam = AVCaptureDevice.default(for: .video),
+              let camInput = try? AVCaptureDeviceInput(device: cam),
+              session.canAddInput(camInput) else {
+            session.commitConfiguration()
+            return
+        }
+        session.addInput(camInput)
+        if let mic = AVCaptureDevice.default(for: .audio),
+           let micInput = try? AVCaptureDeviceInput(device: mic),
+           session.canAddInput(micInput) {
+            session.addInput(micInput)
+        }
+        if session.canAddOutput(output) { session.addOutput(output) }
+        session.commitConfiguration()
+        configured = true
+    }
+
+    func startRecording() {
+        let url = Recorder.newFileURL()
+        isRecording = true
+        queue.async { self.output.startRecording(to: url, recordingDelegate: self) }
+    }
+
+    func stopRecording() {
+        queue.async { if self.output.isRecording { self.output.stopRecording() } }
+    }
+
+    /// ~/Movies/Teleprompter/Take 2026-11-25 at 14.03.22.mov
+    static func newFileURL() -> URL {
+        let base = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Teleprompter", isDirectory: true)
+        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
+        return base.appendingPathComponent("Take \(f.string(from: Date())).mov")
+    }
+
+    func fileOutput(_ output: AVCaptureFileOutput, didStartRecordingTo fileURL: URL, from connections: [AVCaptureConnection]) {
+        DispatchQueue.main.async { self.onStarted?() }
+    }
+
+    func fileOutput(_ output: AVCaptureFileOutput, didFinishRecordingTo outputFileURL: URL,
+                    from connections: [AVCaptureConnection], error: Error?) {
+        var ok = error == nil
+        if let e = error as NSError?,
+           let finished = e.userInfo[AVErrorRecordingSuccessfullyFinishedKey] as? Bool {
+            ok = finished
+        }
+        DispatchQueue.main.async {
+            self.isRecording = false
+            self.onFinished?(ok ? outputFileURL : nil)
+        }
+    }
+}
+
 // MARK: - Main controller
 
 final class PrompterController: NSObject, NSTextViewDelegate {
@@ -156,7 +248,23 @@ final class PrompterController: NSObject, NSTextViewDelegate {
     private let scrollView: NSScrollView = NSTextView.scrollableTextView()
     private var textView: NSTextView { scrollView.documentView as! NSTextView }
     private var playButton: IconButton!
+    private var recordButton: IconButton!
+    private var cameraButton: IconButton!
     private var popover: NSPopover?
+
+    // Camera
+    private let recorder = Recorder()
+    private let previewView = NSView()
+    private var previewLayer: AVCaptureVideoPreviewLayer!
+    private var previewPinned = false          // turned on with the camera button
+    private let countdownLabel = NSTextField(labelWithString: "")
+    private let recBadge = NSTextField(labelWithString: "")
+    private let toast = NSButton(title: "", target: nil, action: nil)
+    private var countdownTimer: Timer?
+    private var recClock: Timer?
+    private var recStart = Date()
+    private var lastSavedURL: URL?
+    private var isCountingDown = false
 
     private var timer: Timer?
     private var lastTick: CFTimeInterval = 0
@@ -229,8 +337,11 @@ final class PrompterController: NSObject, NSTextViewDelegate {
         playButton = IconButton(symbol: "play.fill", target: self, action: #selector(togglePlay), tip: "Play / Pause (⌘↩)")
         let restartButton = IconButton(symbol: "arrow.counterclockwise", target: self, action: #selector(restart), tip: "Back to top")
         let gear = IconButton(symbol: "gearshape.fill", target: self, action: #selector(showSettings(_:)), tip: "Settings")
+        cameraButton = IconButton(symbol: "video", target: self, action: #selector(toggleCameraPreview), tip: "Show camera")
+        recordButton = IconButton(symbol: "record.circle", target: self, action: #selector(toggleRecord), tip: "Record (⌘R)")
+        recordButton.contentTintColor = NSColor.systemRed
 
-        let controls = NSStackView(views: [restartButton, playButton, gear])
+        let controls = NSStackView(views: [cameraButton, recordButton, restartButton, playButton, gear])
         controls.spacing = 2
         controls.wantsLayer = true
         controls.layer?.backgroundColor = NSColor(white: 0.12, alpha: 0.9).cgColor
@@ -251,6 +362,74 @@ final class PrompterController: NSObject, NSTextViewDelegate {
             controls.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -10),
             controls.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -10),
         ])
+
+        buildCameraUI(in: root, below: strip)
+    }
+
+    private func buildCameraUI(in root: NSView, below strip: NSView) {
+        // Small mirrored preview, top-right corner.
+        previewLayer = AVCaptureVideoPreviewLayer(session: recorder.session)
+        previewLayer.videoGravity = .resizeAspectFill
+        previewView.layer = previewLayer
+        previewView.wantsLayer = true
+        previewLayer.cornerRadius = 8
+        previewLayer.masksToBounds = true
+        previewLayer.borderWidth = 1
+        previewLayer.borderColor = NSColor(white: 1, alpha: 0.15).cgColor
+        previewView.isHidden = true
+        previewView.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(previewView)
+
+        // "● REC 0:12" badge, top-left.
+        recBadge.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+        recBadge.textColor = .white
+        recBadge.wantsLayer = true
+        recBadge.layer?.backgroundColor = NSColor.systemRed.withAlphaComponent(0.9).cgColor
+        recBadge.layer?.cornerRadius = 9
+        recBadge.alignment = .center
+        recBadge.isHidden = true
+        recBadge.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(recBadge)
+
+        // Big 3-2-1 in the middle.
+        countdownLabel.font = .systemFont(ofSize: 120, weight: .bold)
+        countdownLabel.textColor = .white
+        countdownLabel.alignment = .center
+        countdownLabel.wantsLayer = true
+        countdownLabel.shadow = { let s = NSShadow(); s.shadowBlurRadius = 20; s.shadowColor = .black; return s }()
+        countdownLabel.isHidden = true
+        countdownLabel.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(countdownLabel)
+
+        // "Saved" note, bottom-left. Click it to see the file in Finder.
+        toast.isBordered = false
+        toast.target = self
+        toast.action = #selector(revealLastTake)
+        toast.wantsLayer = true
+        toast.layer?.backgroundColor = NSColor(white: 0.12, alpha: 0.95).cgColor
+        toast.layer?.cornerRadius = 14
+        toast.isHidden = true
+        toast.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(toast)
+
+        NSLayoutConstraint.activate([
+            previewView.topAnchor.constraint(equalTo: strip.bottomAnchor, constant: 4),
+            previewView.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
+            previewView.widthAnchor.constraint(equalToConstant: 144),
+            previewView.heightAnchor.constraint(equalToConstant: 81),
+            recBadge.topAnchor.constraint(equalTo: strip.bottomAnchor, constant: 4),
+            recBadge.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
+            recBadge.widthAnchor.constraint(equalToConstant: 82),
+            recBadge.heightAnchor.constraint(equalToConstant: 18),
+            countdownLabel.centerXAnchor.constraint(equalTo: root.centerXAnchor),
+            countdownLabel.centerYAnchor.constraint(equalTo: root.centerYAnchor),
+            toast.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
+            toast.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -12),
+            toast.heightAnchor.constraint(equalToConstant: 28),
+        ])
+
+        recorder.onStarted = { [weak self] in self?.recordingDidStart() }
+        recorder.onFinished = { [weak self] url in self?.recordingDidFinish(url) }
     }
 
     private func applyFont() {
@@ -359,6 +538,134 @@ final class PrompterController: NSObject, NSTextViewDelegate {
         scroll(to: max(0, offset + dy))
     }
 
+    // MARK: Camera + recording
+
+    private var isBusyRecording: Bool { recorder.isRecording || isCountingDown }
+    var isRecordingTake: Bool { isBusyRecording }
+
+    private func setPreviewVisible(_ visible: Bool) {
+        if visible, let c = previewLayer.connection, c.isVideoMirroringSupported {
+            c.automaticallyAdjustsVideoMirroring = false
+            c.isVideoMirrored = true   // preview looks like a mirror; the saved video is normal
+        }
+        previewView.isHidden = !visible
+    }
+
+    @objc func toggleCameraPreview() {
+        if previewPinned {
+            previewPinned = false
+            cameraButton.setSymbol("video")
+            if !isBusyRecording {
+                setPreviewVisible(false)
+                recorder.stopCamera()
+            }
+            return
+        }
+        recorder.startCamera { [weak self] ok in
+            guard let self = self else { return }
+            guard ok else { self.showPermissionAlert(); return }
+            self.previewPinned = true
+            self.cameraButton.setSymbol("video.fill")
+            self.setPreviewVisible(true)
+        }
+    }
+
+    @objc func toggleRecord() {
+        if isBusyRecording { stopRecording(); return }
+        recorder.startCamera { [weak self] ok in
+            guard let self = self else { return }
+            guard ok else { self.showPermissionAlert(); return }
+            self.setPreviewVisible(true)
+            self.toast.isHidden = true
+            self.pause()
+            self.offset = 0
+            self.scroll(to: 0)
+            self.isCountingDown = true
+            self.recordButton.setSymbol("stop.circle.fill")
+            self.recordButton.toolTip = "Stop recording (⌘R)"
+            self.recorder.startRecording()
+        }
+    }
+
+    /// Camera is rolling: run 3-2-1, then start scrolling from the top.
+    private func recordingDidStart() {
+        recStart = Date()
+        recBadge.isHidden = false
+        updateRecBadge()
+        recClock?.invalidate()
+        recClock = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.updateRecBadge() }
+
+        var n = 3
+        countdownLabel.stringValue = "\(n)"
+        countdownLabel.isHidden = false
+        countdownTimer?.invalidate()
+        countdownTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] t in
+            guard let self = self else { t.invalidate(); return }
+            n -= 1
+            if n > 0 {
+                self.countdownLabel.stringValue = "\(n)"
+            } else {
+                t.invalidate()
+                self.countdownLabel.isHidden = true
+                self.isCountingDown = false
+                if self.recorder.isRecording { self.play() }
+            }
+        }
+    }
+
+    private func updateRecBadge() {
+        let secs = Int(Date().timeIntervalSince(recStart))
+        recBadge.stringValue = String(format: "● REC %d:%02d", secs / 60, secs % 60)
+    }
+
+    func stopRecording() {
+        countdownTimer?.invalidate()
+        countdownLabel.isHidden = true
+        isCountingDown = false
+        pause()
+        recorder.stopRecording()
+    }
+
+    private func recordingDidFinish(_ url: URL?) {
+        recClock?.invalidate()
+        recBadge.isHidden = true
+        countdownLabel.isHidden = true
+        isCountingDown = false
+        recordButton.setSymbol("record.circle")
+        recordButton.toolTip = "Record (⌘R)"
+        if !previewPinned {
+            setPreviewVisible(false)
+            recorder.stopCamera()
+        }
+
+        lastSavedURL = url
+        let text = url == nil ? "  Recording failed, try again  " : "  Saved to Movies › Teleprompter  "
+        toast.attributedTitle = NSAttributedString(string: text, attributes: [
+            .foregroundColor: url == nil ? NSColor.systemRed : NSColor.white,
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+        ])
+        toast.toolTip = url == nil ? nil : "Show in Finder"
+        toast.isHidden = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in self?.toast.isHidden = true }
+    }
+
+    @objc private func revealLastTake() {
+        if let url = lastSavedURL { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+        toast.isHidden = true
+    }
+
+    private func showPermissionAlert() {
+        let a = NSAlert()
+        a.messageText = "Teleprompter can't use the camera"
+        a.informativeText = "Turn on Teleprompter in System Settings › Privacy & Security › Camera (and Microphone), then try again."
+        a.addButton(withTitle: "Open Settings")
+        a.addButton(withTitle: "Cancel")
+        if a.runModal() == .alertFirstButtonReturn,
+           let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
     // MARK: Settings
 
     @objc func showSettings(_ sender: NSButton) {
@@ -390,6 +697,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let c = self?.controller else { return e }
             let cmd = e.modifierFlags.contains(.command)
             switch e.keyCode {
+            case 15 where cmd:             // ⌘R  record / stop
+                c.toggleRecord(); return nil
             case 36 where cmd:             // ⌘↩  play / pause
                 c.togglePlay(); return nil
             case 49 where c.isPlaying:     // space while playing  pause
@@ -404,6 +713,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return e
             }
         }
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard controller.isRecordingTake else { return .terminateNow }
+        controller.stopRecording()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { NSApp.reply(toApplicationShouldTerminate: true) }
+        return .terminateLater
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
