@@ -1,4 +1,5 @@
 import AppKit
+import QuartzCore
 
 // MARK: - Settings
 
@@ -152,8 +153,8 @@ final class SettingsViewController: NSViewController {
 
 final class PrompterController: NSObject, NSTextViewDelegate {
     let panel: PrompterPanel
-    private let scrollView = NSScrollView()
-    private let textView = NSTextView()
+    private let scrollView: NSScrollView = NSTextView.scrollableTextView()
+    private var textView: NSTextView { scrollView.documentView as! NSTextView }
     private var playButton: IconButton!
     private var popover: NSPopover?
 
@@ -214,15 +215,10 @@ final class PrompterController: NSObject, NSTextViewDelegate {
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticSpellingCorrectionEnabled = false
         textView.textContainerInset = NSSize(width: 22, height: 18)
-        textView.isVerticallyResizable = true
-        textView.isHorizontallyResizable = false
-        textView.autoresizingMask = [.width]
-        textView.textContainer?.widthTracksTextView = true
         textView.delegate = self
         textView.string = Settings.text
         applyFont()
 
-        scrollView.documentView = textView
         root.addSubview(scrollView)
 
         let strip = DragStrip()
@@ -231,10 +227,10 @@ final class PrompterController: NSObject, NSTextViewDelegate {
 
         // Controls (bottom-right, subtle)
         playButton = IconButton(symbol: "play.fill", target: self, action: #selector(togglePlay), tip: "Play / Pause (⌘↩)")
-        let restart = IconButton(symbol: "arrow.counterclockwise", target: self, action: #selector(restart), tip: "Back to top")
+        let restartButton = IconButton(symbol: "arrow.counterclockwise", target: self, action: #selector(restart), tip: "Back to top")
         let gear = IconButton(symbol: "gearshape.fill", target: self, action: #selector(showSettings(_:)), tip: "Settings")
 
-        let controls = NSStackView(views: [restart, playButton, gear])
+        let controls = NSStackView(views: [restartButton, playButton, gear])
         controls.spacing = 2
         controls.wantsLayer = true
         controls.layer?.backgroundColor = NSColor(white: 0.12, alpha: 0.9).cgColor
